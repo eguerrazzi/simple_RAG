@@ -319,10 +319,21 @@ async def list_models():
     return ModelsResponse(data=models)
 
 
-def run_query_sync(user_message: str):
+def run_query_sync(user_message: str, conversation_context: str = ""):
     """Esegue la query in modo sincrono (per thread separato)"""
+    # Se c'è contesto conversazione, lo aggiungiamo alla query
+    if conversation_context:
+        full_query = f"""Contesto della conversazione precedente:
+{conversation_context}
+
+Nuova domanda dell'utente: {user_message}
+
+Rispondi alla nuova domanda tenendo conto del contesto precedente."""
+    else:
+        full_query = user_message
+    
     if query_engine is not None:
-        response = query_engine.query(user_message)
+        response = query_engine.query(full_query)
         answer = str(response)
         
         sources_text = ""
@@ -335,7 +346,7 @@ def run_query_sync(user_message: str):
         
         return answer + sources_text, len(response.source_nodes) if hasattr(response, 'source_nodes') and response.source_nodes else 0
     elif llm is not None:
-        response = llm.complete(user_message)
+        response = llm.complete(full_query)
         return str(response) + "\n\n⚠️ *Risposta senza RAG (nessun documento caricato)*", 0
     else:
         return "❌ Sistema non inizializzato. Riavvia il server.", 0
@@ -347,18 +358,25 @@ async def chat_completions(request: ChatCompletionRequest):
     """
     Chat completions endpoint (OpenAI-compatible)
     Usa il sistema RAG per rispondere alle domande
+    Supporta memoria conversazione tramite i messaggi precedenti
     """
     print(f"\n{'='*60}")
     print(f"📨 Nuova richiesta chat")
     print(f"{'='*60}")
     
-    # Estrai l'ultimo messaggio dell'utente
+    # Estrai messaggi e costruisci contesto conversazione
     user_message = None
     system_prompt = None
+    conversation_history = []
     
     for msg in request.messages:
         if msg.role == "user":
             user_message = msg.content
+            conversation_history.append(f"Utente: {msg.content}")
+        elif msg.role == "assistant":
+            # Rimuovi le fonti dal contesto per non inquinare
+            content = msg.content.split("\n\n---\n📚 **Fonti:**")[0] if msg.content else ""
+            conversation_history.append(f"Assistente: {content}")
         elif msg.role == "system":
             system_prompt = msg.content
     
@@ -366,7 +384,14 @@ async def chat_completions(request: ChatCompletionRequest):
         print("❌ Nessun messaggio utente trovato")
         raise HTTPException(status_code=400, detail="Nessun messaggio utente trovato")
     
+    # Costruisci contesto (escludi l'ultimo messaggio che è la domanda attuale)
+    # Prendi solo gli ultimi 6 messaggi per non superare limiti token
+    context_messages = conversation_history[:-1][-6:] if len(conversation_history) > 1 else []
+    conversation_context = "\n".join(context_messages)
+    
     print(f"💬 Domanda: {user_message[:100]}{'...' if len(user_message) > 100 else ''}")
+    if context_messages:
+        print(f"📝 Contesto conversazione: {len(context_messages)} messaggi precedenti")
     
     try:
         print("🔍 Esecuzione query...")
@@ -376,7 +401,8 @@ async def chat_completions(request: ChatCompletionRequest):
         full_response, num_sources = await loop.run_in_executor(
             executor, 
             run_query_sync, 
-            user_message
+            user_message,
+            conversation_context
         )
         
         print(f"✅ Risposta ricevuta ({len(full_response)} caratteri)")
@@ -419,6 +445,89 @@ async def health_check():
         "index_loaded": index is not None,
         "model": MODEL_NAME
     }
+
+
+@app.get("/documents")
+async def list_documents():
+    """Lista dei documenti indicizzati nel sistema RAG"""
+    documents_list = []
+    
+    # Leggi documenti dalla cartella
+    if os.path.exists(DOCUMENTS_PATH):
+        for filename in os.listdir(DOCUMENTS_PATH):
+            filepath = os.path.join(DOCUMENTS_PATH, filename)
+            if os.path.isfile(filepath):
+                ext = os.path.splitext(filename)[1].lower()
+                if ext in ['.pdf', '.txt', '.docx', '.md']:
+                    stat = os.stat(filepath)
+                    documents_list.append({
+                        "filename": filename,
+                        "extension": ext,
+                        "size_bytes": stat.st_size,
+                        "size_readable": f"{stat.st_size / 1024:.1f} KB" if stat.st_size < 1024*1024 else f"{stat.st_size / (1024*1024):.1f} MB",
+                        "modified": stat.st_mtime
+                    })
+    
+    # Info sull'indice
+    index_info = None
+    if index is not None:
+        try:
+            # Ottieni info sui nodi nell'indice
+            docstore = index.storage_context.docstore
+            num_nodes = len(docstore.docs)
+            index_info = {
+                "loaded": True,
+                "num_chunks": num_nodes
+            }
+        except:
+            index_info = {"loaded": True, "num_chunks": "unknown"}
+    else:
+        index_info = {"loaded": False, "num_chunks": 0}
+    
+    return {
+        "documents": documents_list,
+        "total_files": len(documents_list),
+        "index": index_info,
+        "supported_extensions": [".pdf", ".txt", ".docx", ".md"]
+    }
+
+
+@app.post("/reload")
+async def reload_index():
+    """
+    Reindicizza il sistema RAG senza riavviare il server.
+    Chiamato dall'Admin Panel dopo l'upload o la reindicizzazione.
+    """
+    print("\n" + "="*60)
+    print("🔄 RELOAD RICHIESTO - Reindicizzazione in corso...")
+    print("="*60 + "\n")
+    
+    try:
+        # Crea il flag di reindicizzazione
+        reindex_flag = Path("./REINDEX_REQUIRED")
+        reindex_flag.write_text(f"Reindicizzazione richiesta il {time.time()}")
+        
+        # Esegui setup_rag in un thread separato per non bloccare
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(executor, setup_rag)
+        
+        print("\n" + "="*60)
+        print("✅ RELOAD COMPLETATO - Sistema pronto!")
+        print("="*60 + "\n")
+        
+        return {
+            "status": "success",
+            "message": "Reindicizzazione completata con successo",
+            "index_loaded": index is not None,
+            "query_engine_ready": query_engine is not None
+        }
+    except Exception as e:
+        print(f"\n❌ ERRORE DURANTE RELOAD: {e}\n")
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Errore durante la reindicizzazione: {str(e)}"
+        )
 
 
 # ============================================================================

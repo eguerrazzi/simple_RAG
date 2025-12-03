@@ -255,7 +255,7 @@ HTML_TEMPLATE = """
         </div>
 
         <!-- Documents List -->
-        <div class="card">
+        <div class="card mb-4">
             <div class="card-header bg-white d-flex justify-content-between align-items-center">
                 <h5 class="mb-0"><i class="bi bi-files me-2"></i>Documenti Caricati</h5>
                 <span class="badge bg-secondary">{{ documents|length }} file</span>
@@ -311,6 +311,19 @@ HTML_TEMPLATE = """
                 {% endif %}
             </div>
         </div>
+
+        <!-- RAG Index Status -->
+        <div class="card">
+            <div class="card-header bg-white">
+                <h5 class="mb-0"><i class="bi bi-database me-2"></i>Stato Indice RAG (API Server)</h5>
+            </div>
+            <div class="card-body" id="ragStatus">
+                <div class="text-center py-3">
+                    <div class="spinner-border spinner-border-sm text-primary" role="status"></div>
+                    <span class="ms-2">Caricamento stato RAG...</span>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
@@ -319,6 +332,38 @@ HTML_TEMPLATE = """
         const fileInput = document.getElementById('fileInput');
         const fileList = document.getElementById('fileList');
         const uploadBtn = document.getElementById('uploadBtn');
+
+        // Carica stato RAG
+        async function loadRagStatus() {
+            try {
+                const response = await fetch('http://localhost:8000/documents');
+                if (response.ok) {
+                    const data = await response.json();
+                    let html = '<div class="row mb-3">';
+                    html += '<div class="col-md-4 text-center"><h4 class="text-primary">' + data.total_files + '</h4><small class="text-muted">File nella cartella</small></div>';
+                    html += '<div class="col-md-4 text-center"><h4 class="text-success">' + (data.index.num_chunks || 0) + '</h4><small class="text-muted">Chunks indicizzati</small></div>';
+                    html += '<div class="col-md-4 text-center"><h4 class="' + (data.index.loaded ? 'text-success' : 'text-danger') + '">' + (data.index.loaded ? '✓ Online' : '✗ Offline') + '</h4><small class="text-muted">Stato indice</small></div>';
+                    html += '</div>';
+                    
+                    if (data.documents && data.documents.length > 0) {
+                        html += '<hr><h6 class="text-muted mb-3">Documenti nel sistema RAG:</h6>';
+                        html += '<div class="table-responsive"><table class="table table-sm table-hover"><thead><tr><th>File</th><th>Tipo</th><th>Dimensione</th></tr></thead><tbody>';
+                        data.documents.forEach(doc => {
+                            const icon = doc.extension === '.pdf' ? '📕' : doc.extension === '.md' ? '📝' : doc.extension === '.txt' ? '📄' : '📘';
+                            html += '<tr><td>' + icon + ' ' + doc.filename + '</td><td><span class="badge bg-secondary">' + doc.extension + '</span></td><td>' + doc.size_readable + '</td></tr>';
+                        });
+                        html += '</tbody></table></div>';
+                    }
+                    document.getElementById('ragStatus').innerHTML = html;
+                } else {
+                    document.getElementById('ragStatus').innerHTML = '<div class="alert alert-warning mb-0"><i class="bi bi-exclamation-triangle me-2"></i>API Server non raggiungibile su porta 8000</div>';
+                }
+            } catch (e) {
+                document.getElementById('ragStatus').innerHTML = '<div class="alert alert-danger mb-0"><i class="bi bi-x-circle me-2"></i>Errore connessione: ' + e.message + '</div>';
+            }
+        }
+        loadRagStatus();
+        setInterval(loadRagStatus, 30000); // Aggiorna ogni 30 secondi
 
         // Drag and drop
         ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
@@ -515,11 +560,10 @@ async def delete_document(doc_id: int, username: str = Depends(verify_admin)):
 
 @app.post("/reindex")
 async def reindex(username: str = Depends(verify_admin)):
-    """Reindicizza tutti i documenti"""
+    """Reindicizza tutti i documenti e ricarica automaticamente l'API Server"""
     
     try:
         # Crea un file flag che indica di reindicizzare
-        # Il server API lo leggerà al prossimo avvio
         flag_file = Path("./REINDEX_REQUIRED")
         flag_file.write_text(f"Reindicizzazione richiesta il {datetime.now()}")
         
@@ -534,14 +578,46 @@ async def reindex(username: str = Depends(verify_admin)):
         conn.commit()
         conn.close()
         
-        message = "✅ Reindicizzazione programmata! Riavvia api_server.py per applicare le modifiche."
-        msg_type = "success"
+        # 🆕 CHIAMA L'API SERVER PER RELOAD AUTOMATICO
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:  # Timeout 2 minuti per indicizzazione
+                response = await client.post("http://localhost:8000/reload")
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    message = f"✅ {result.get('message', 'Reindicizzazione completata!')} Sistema pronto!"
+                    msg_type = "success"
+                    
+                    # Aggiorna database: documenti ora indicizzati
+                    conn = get_db()
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE documents SET indexed = TRUE")
+                    cursor.execute("""
+                        INSERT INTO index_history (action, documents_count)
+                        SELECT 'reindex_completed', COUNT(*) FROM documents
+                    """)
+                    conn.commit()
+                    conn.close()
+                else:
+                    message = f"⚠️ Reindicizzazione richiesta ma API Server ha risposto con errore (status {response.status_code})"
+                    msg_type = "warning"
+        except httpx.ConnectError:
+            message = "⚠️ API Server non raggiungibile. Assicurati che sia in esecuzione su porta 8000, poi riavvialo manualmente."
+            msg_type = "warning"
+        except httpx.TimeoutException:
+            message = "⚠️ Reindicizzazione in corso... Potrebbe richiedere alcuni minuti. Ricarica la pagina tra poco."
+            msg_type = "info"
+        except Exception as e:
+            message = f"⚠️ Errore durante il reload automatico: {str(e)}. Riavvia api_server.py manualmente."
+            msg_type = "warning"
         
     except Exception as e:
         message = f"❌ Errore: {str(e)}"
         msg_type = "danger"
     
     return RedirectResponse(url=f"/?message={message}&type={msg_type}", status_code=303)
+
 
 
 @app.get("/logout")
